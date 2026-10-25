@@ -1,0 +1,93 @@
+name: vigia
+# Vigia externo (25/10/2026): roda fora da casa e fora da Hostinger. A cada 10 min confere se o
+# Radar, a Ponte e o cérebro da Bia respondem e avisa no ntfy só quando o estado muda (caiu /
+# voltou), pra não virar ruído. Só endereços públicos; o tópico do ntfy fica no secret NTFY_URL.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: vigia
+  cancel-in-progress: false
+
+jobs:
+  vigia:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confere os servicos
+        id: confere
+        run: |
+          set -u
+          falhas=""
+          add() { falhas="${falhas:+$falhas, }$1"; }
+
+          # Radar: healthz 200 com ok=true e nenhum check essencial em error.
+          if body=$(curl -fsS -m 25 https://radar.reactiva.com.br/api/healthz); then
+            ruins=$(printf '%s' "$body" | python3 -c '
+          import sys, json
+          d = json.load(sys.stdin)
+          if not d.get("ok"):
+              print("Radar"); raise SystemExit
+          c = d.get("checks") or {}
+          for k in ("db", "auth", "conversa_tempo_real", "bia_gateway", "cron_heartbeats", "grants"):
+              if (c.get(k) or {}).get("status") == "error":
+                  print("Radar:" + k)
+          ' 2>/dev/null || echo "Radar")
+            for r in $ruins; do add "$r"; done
+          else
+            add "Radar fora do ar"
+          fi
+
+          # Ponte: /health 200 e disjuntor do .50 fechado.
+          if body=$(curl -fsS -m 25 https://ia.reactiva.com.br/health); then
+            br=$(printf '%s' "$body" | python3 -c 'import sys,json; print(((json.load(sys.stdin).get("local_llm") or {}).get("breaker") or "?"))' 2>/dev/null || echo "?")
+            [ "$br" = "open" ] && add "Ponte: cerebro .50 cortado (disjuntor aberto)"
+          else
+            add "Ponte fora do ar"
+          fi
+
+          # Cerebro da Bia (.50, em casa) pelo tunel.
+          if ! curl -fsS -m 25 https://gw.reactiva.com.br/ | grep -q reactiva-gateway; then
+            add "Cerebro .50 inalcancavel (casa, tunel ou energia)"
+          fi
+
+          echo "falhas=$falhas" >> "$GITHUB_OUTPUT"
+          echo "falhas: ${falhas:-nenhuma}"
+
+      - name: Avisa so na troca de estado
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          FALHAS: ${{ steps.confere.outputs.falhas }}
+        run: |
+          set -u
+          prev=$(gh run list -R "$GITHUB_REPOSITORY" -w vigia.yml -s completed -L 1 --json conclusion -q '.[0].conclusion' 2>/dev/null || echo desconhecido)
+          avisa() {
+            [ -n "${NTFY_URL:-}" ] || { echo "sem NTFY_URL"; return 0; }
+            curl -fsS -m 20 -H "Title: Vigia externo" -H "Priority: $1" -H "Tags: $2" -d "$3" "$NTFY_URL" >/dev/null || echo "ntfy falhou"
+          }
+          if [ -n "$FALHAS" ]; then
+            if [ "$prev" != "failure" ]; then avisa 4 warning "Fora do ar: $FALHAS"; fi
+            echo "::error::$FALHAS"
+            exit 1
+          fi
+          if [ "$prev" = "failure" ]; then avisa 3 white_check_mark "Voltou: Radar, Ponte e cerebro respondendo"; fi
+
+      - name: Mantem o agendamento vivo
+        if: always()
+        run: |
+          # O GitHub desliga agendamento de repo publico depois de 60 dias sem commit.
+          [ "$(date -u +%d%H)" = "0100" ] || exit 0
+          git init -q vivo && cd vivo
+          git config user.name "vigia"
+          git config user.email "vigia@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git fetch -q --depth 1 origin main && git checkout -q -B main FETCH_HEAD
+          git commit -q --allow-empty -m "chore: mantem o vigia agendado"
+          git push -q origin main
